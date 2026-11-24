@@ -1,0 +1,733 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7a2ea75..1373fee 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,6 +128,14 @@ link_ggml_backends(yue-tokenize)
+ # yue-synth: full pipeline (score -> semantic -> flow matching -> VAE -> audio)
+ add_executable(yue-synth tools/yue-synth.cpp src/request.cpp src/model-store.cpp)
+ target_link_libraries(yue-synth PRIVATE yyjson)
++# Kroma: the NAR's layers on the phone's DSP (src/kroma_nar.h), through Kengine's libkblock.so (FastRPC)
++set(KROMA_ENGINE_DIR "" CACHE PATH "the folder with Kengine's libkblock.so and a libcdsprpc.so to link against")
++if(KROMA_ENGINE_DIR)
++    target_compile_definitions(yue-synth PRIVATE KROMA_ENGINE)
++    # Kengine's call headers (../kroma_inc: kblock.h and kremote.h from Kengine's src)
++    target_include_directories(yue-synth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kroma_inc)
++    target_link_libraries(yue-synth PRIVATE ${KROMA_ENGINE_DIR}/libkblock.so ${KROMA_ENGINE_DIR}/libcdsprpc.so)
++endif()
+ link_ggml_backends(yue-synth)
+ 
+ # webui: convert tools/public/index.html.gz to a C header for embedding.
+diff --git a/src/nar.h b/src/nar.h
+index 2064af4..517cdae 100644
+--- a/src/nar.h
++++ b/src/nar.h
+@@ -444,6 +444,13 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
+     return true;
+ }
+ 
++#ifdef KROMA_ENGINE
++#    include "kroma_nar.h"
++#    include "kroma_ar.h"
++// the AR prefill on the DSP when YUE_ENGINE_AR is set (kroma_ar.h); its weights let go once the NAR's load (kn_init)
++static const bool g_kar_hooked = (g_qw3lm_prefill_hook = kar_forward, true);
++#endif
++
+ // One velocity evaluation of M variations: x_t [M, T_lat, latent_dim] time
+ // major per variation, raw timestep shared. ar_len is the AR prefix length
+ // resident in set kv_set of the cache. Writes v in the layout of x_t.
+@@ -456,6 +463,13 @@ static bool nar_velocity(Yue2NAR *            n,
+                          int                  kv_set,
+                          float                raw_t,
+                          float *              v_out) {
++#ifdef KROMA_ENGINE
++    // the layers on the phone's DSP when YUE_ENGINE is set (kroma_nar.h); ggml below if not, or if it fails
++    if (g_kar.ok) kar_release();     // the AR prefill is over: its weights make room for the NAR's
++    if (kn_velocity(n, kv, x_t, T_lat, M, ar_len, kv_set, raw_t, v_out)) {
++        return true;
++    }
++#endif
+     if (!nar_build_graph(n, kv, T_lat, M, ar_len, kv_set)) {
+         return false;
+     }
+diff --git a/src/pipeline.h b/src/pipeline.h
+index f5a2159..93badc6 100644
+--- a/src/pipeline.h
++++ b/src/pipeline.h
+@@ -546,6 +546,24 @@ static bool pipeline_generate(Yue2Pipeline *          p,
+                 semantic.min_tokens = semantic.max_tokens;
+             }
+         }
++        // Kroma: a requested length is a target, not a cut: from 85% of it the model is nudged to its end token (sampling.h
++        // soft_end), and the budget becomes a safety cap at 130% (within the stage's own preset)
++        if (r.duration > 0.0f) {
++            const int target     = semantic.max_tokens;
++            semantic.soft_target = target;
++            semantic.soft_end    = std::max(semantic.min_tokens, target * 85 / 100);
++            semantic.max_tokens  = std::min(r.semantic_sampling.max_tokens, target * 130 / 100);
++            // a length the user chose (the app passes KROMA_YUE_MIN, seconds): no end token before it either, so a song asked for
++            // two minutes does not stop at one; "auto" leaves the floor to the model
++            if (const char * mn = getenv("KROMA_YUE_MIN")) {
++                const int floor_frames = std::min(semantic.soft_end, (int) (atof(mn) * (double) YUE2_FRAME_RATE));
++                if (floor_frames > semantic.min_tokens) {
++                    semantic.min_tokens = floor_frames;
++                }
++            }
++            fprintf(stderr, "[AR] Soft end from frame %d, target %d, cap %d, no end before %d\n", semantic.soft_end, target,
++                    semantic.max_tokens, semantic.min_tokens);
++        }
+         if (!yue2_generate(lm, &p->kv, prefixes, negatives, guidance, semantic, r.lm_seed, YUE2_PHASE_SEMANTIC, &codes,
+                            cancelled, cancel_data)) {
+             return false;
+@@ -573,6 +591,17 @@ static bool pipeline_generate(Yue2Pipeline *          p,
+                     context);
+             return false;
+         }
++#ifdef KROMA_ENGINE
++        // Kroma: the NAR on the DSP takes only what fits its VTCM (kn_max_frames): a longer song in equal chunks of that
++        if (getenv("YUE_ENGINE")) {
++            const int fit = kn_max_frames((int) prefixes[i].size());
++            if (fit > 0 && fit < chunk_sizes[i]) chunk_sizes[i] = fit;
++            if (fit > 0 && T_lat > chunk_sizes[i]) {
++                const int n = (T_lat + chunk_sizes[i] - 1) / chunk_sizes[i];
++                chunk_sizes[i] = (T_lat + n - 1) / n;
++            }
++        }
++#endif
+         for (int j = 0; j < M; j++) {
+             Yue2Song & song = (*songs)[(size_t) i * M + j];
+             song.score      = scores[i];
+diff --git a/src/qwen3-lm.h b/src/qwen3-lm.h
+index fa28852..5365c50 100644
+--- a/src/qwen3-lm.h
++++ b/src/qwen3-lm.h
+@@ -103,6 +103,11 @@ struct Qwen3LM {
+     Qw3lmGraphCache batch_graph;
+ };
+ 
++// Kroma: a prefill run elsewhere (kroma_ar.h sets it: the phone's DSP); false sends it to the ggml graph below
++struct Qw3lmKvCache;
++static bool (*g_qw3lm_prefill_hook)(Qwen3LM *, Qw3lmKvCache *, const int *, int, int, float *, int, int) = nullptr;
++static bool g_qw3lm_has_adapters = false;   // adapters merged into the AR weights: a copy of the weights elsewhere lacks them
++
+ // Parse config.json integers, floats, bools
+ static int qw3lm_json_int(const char * json, const char * key, int fb) {
+     char needle[128];
+@@ -200,7 +205,7 @@ static void qw3lm_init_backend(Qwen3LM * m) {
+     m->backend        = bp.backend;
+     m->cpu_backend    = bp.cpu_backend;
+     m->sched          = backend_sched_new(bp, 8192);
+-    m->use_flash_attn = bp.has_gpu;
++    m->use_flash_attn = bp.has_gpu || (getenv("YUE_CPU_FA") && *getenv("YUE_CPU_FA") == '1');   // Kroma: flash attention on the CPU too
+     m->clamp_fp16     = false;
+ }
+ 
+@@ -362,6 +367,7 @@ static bool qw3lm_load(Qwen3LM * m, const char * gguf_path, const std::vector<Ad
+         gf_close(&gf);
+         return false;
+     }
++    g_qw3lm_has_adapters = !adapters.empty();
+     wctx_alloc(&m->wctx, m->backend);
+     gf_close(&gf);
+ 
+@@ -504,6 +510,10 @@ static void qw3lm_forward(Qwen3LM *      m,
+         m->batch_graph.built = false;
+     }
+ 
++    if (g_qw3lm_prefill_hook && g_qw3lm_prefill_hook(m, kv, token_ids, n_tokens, kv_set, logits, row0, rows)) {
++        return;
++    }
++
+     const Qwen3LMConfig & c      = m->cfg;
+     int                   H      = c.hidden_size;
+     int                   kv_pos = kv->pos[kv_set];
+diff --git a/src/sampling.h b/src/sampling.h
+index 3d59e92..6a98b7a 100644
+--- a/src/sampling.h
++++ b/src/sampling.h
+@@ -29,7 +29,13 @@ struct Yue2Sampling {
+     int   penalty_window;
+     int   min_tokens;
+     int   max_tokens;
++    // Kroma: from soft_end tokens on (0: off) the end token's logit gains a bonus that reaches SOFT_END_BONUS at soft_target and
++    // keeps growing past it, so a song ends where the model closes a phrase near the length asked for; max_tokens stays only as
++    // a safety cap well beyond (a song the model never ended ran out the phone's memory)
++    int   soft_end    = 0;
++    int   soft_target = 0;
+ };
++static const float SOFT_END_BONUS = 10.0f;
+ 
+ // The bounds the protocol enforces on an overridden preset
+ static bool yue2_sampling_valid(const Yue2Sampling & s, const char * stage) {
+@@ -94,7 +100,11 @@ static void yue2_distribution(const float *                logits,
+         out.push_back({ id, logits[id - row0] });
+     }
+     if (step >= s.min_tokens) {
+-        out.push_back({ end, logits[end - row0] });
++        float bonus = 0.0f;
++        if (s.soft_end > 0 && step >= s.soft_end && s.soft_target > s.soft_end) {
++            bonus = SOFT_END_BONUS * (float) (step - s.soft_end) / (float) (s.soft_target - s.soft_end);
++        }
++        out.push_back({ end, logits[end - row0] + bonus });
+     }
+ 
+     // The ids of the penalty window scale by their frequency in it, negatives
+diff --git a/src/vae.h b/src/vae.h
+index 2f57edf..df72884 100644
+--- a/src/vae.h
++++ b/src/vae.h
+@@ -466,6 +466,10 @@ static int vae_ggml_decode(VAEGGML * m, const float * latent, int T_latent, floa
+ // so every output sample carries the full receptive field of the untiled
+ // decoder. There is no crossfade and no zero padding: the concatenated cores
+ // are the waveform. Returns T_audio (samples per channel) or -1 on error.
++#ifndef KROMA_VAE_HOOK_DECL
++#define KROMA_VAE_HOOK_DECL
++static int (*g_vae_dsp_hook)(const float *, int, float *, int, bool (*)(void *), void *) = nullptr;
++#endif
+ static int vae_ggml_decode_tiled(VAEGGML *     m,
+                                  const float * latent,     // [T_latent, 64] flat time-major
+                                  int           T_latent,
+@@ -480,6 +484,10 @@ static int vae_ggml_decode_tiled(VAEGGML *     m,
+         fprintf(stderr, "[VAE] T_audio %d exceeds max %d\n", total, max_T_audio);
+         return -1;
+     }
++    if (g_vae_dsp_hook) {
++        const int r = g_vae_dsp_hook(latent, T_latent, audio_out, max_T_audio, cancel, cancel_data);
++        if (r >= 0) return r;
++    }
+ 
+     // Short sequence: decode directly
+     if (T_latent <= core_frames) {
+diff --git a/tools/yue-synth.cpp b/tools/yue-synth.cpp
+index 27ab67b..89fd918 100644
+--- a/tools/yue-synth.cpp
++++ b/tools/yue-synth.cpp
+@@ -8,6 +8,7 @@
+ #include "pipeline.h"
+ #include "version.h"
+ 
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -199,6 +200,17 @@ int main(int argc, char ** argv) {
+             return 1;
+         }
+ 
++        // A song cut by the length budget (no end token) would stop mid note: its last 6 s fade out instead, on a cosine.
++        // The audio is planar stereo [L: T][R: T]
++        if (song.truncated && song.T_audio > 0) {
++            const int64_t T = song.T_audio, n = std::min<int64_t>(T, (int64_t) 6 * YUE2_SAMPLE_RATE);
++            for (int64_t k = 0; k < n; k++) {
++                const float g = 0.5f + 0.5f * cosf(3.14159265f * (float) k / (float) n);
++                song.audio[(size_t) (T - n + k)] *= g;
++                song.audio[(size_t) (2 * T - n + k)] *= g;
++            }
++            fprintf(stderr, "[Synth] Cut by the length budget: last %.1f s faded out\n", (double) n / YUE2_SAMPLE_RATE);
++        }
+         if (!audio_write(path.c_str(), song.audio.data(), song.T_audio, YUE2_SAMPLE_RATE, is_mp3, wav_fmt,
+                          r.mp3_bitrate, r.peak_clip)) {
+             return 1;
+diff --git a/src/kroma_ar.h b/src/kroma_ar.h
+new file mode 100644
+index 0000000..61ec33f
+--- /dev/null
++++ b/src/kroma_ar.h
+@@ -0,0 +1,182 @@
++// kroma_ar.h : the AR half's prompt prefill on the Kroma engine (the phone's DSP: kblock_yrun run causally) instead of ggml on the CPU.
++//
++// On when YUE_ENGINE_AR names a folder with the AR layers as the engine's files (made by Kroma's converter tools, not in this repository):
++//   weights_l<i>.bin, prm_l<i>.f32, format.txt -- and the skel as for kroma_nar.h (KROMA_SKEL, ADSP_LIBRARY_PATH).
++// A prefill from position 0 (the score's and the semantic stage's prompts) runs as one causal pass of all its rows per layer:
++// the embedding rows and the RoPE on the CPU, the 28 layers on the DSP, each layer's new K (normed, rotated) and V written into the
++// ggml cache rows the decode then reads, the last row's final norm and LM head window on the CPU. Anything else (a prefill on top
++// of cached rows, adapters merged into the AR weights, a failure) goes to ggml.
++#pragma once
++
++#include "kroma_nar.h"
++#include "kroma_vae.h"
++
++#define KAR_MAXN 4224            // rows one pass takes (the attention's VTCM holds the keys of 4224, Krea's)
++
++struct KromaAr {
++    bool               tried = false, ok = false;
++    remote_handle64    h     = 0;
++    int                nl = 0, fmt = 0;
++    size_t             wB = 0;
++    uint16_t *         w[KN_MAX]   = {};
++    float *            prm[KN_MAX] = {};
++    uint16_t *         inp = nullptr, *scr = nullptr, *xo = nullptr;
++    size_t             inp_n = 0, scr_n = 0, xo_n = 0;
++    uint16_t *         wall = nullptr; float * prall = nullptr;   // every layer's weights and parameters, one allocation each
++};
++static KromaAr g_kar;
++
++static void kar_release() {
++    for (int i = 0; i < KN_MAX; i++) { g_kar.w[i] = nullptr; g_kar.prm[i] = nullptr; }
++    if (g_kar.wall) rpcmem_free(g_kar.wall);
++    if (g_kar.prall) rpcmem_free(g_kar.prall);
++    g_kar.wall = nullptr; g_kar.prall = nullptr;
++    for (uint16_t ** p : { &g_kar.inp, &g_kar.scr, &g_kar.xo }) { if (*p) rpcmem_free(*p); *p = nullptr; }
++    g_kar.inp_n = g_kar.scr_n = g_kar.xo_n = 0;
++    if (g_kar.h) kblock_close(g_kar.h);
++    g_kar.h = 0; g_kar.ok = false;
++}
++
++static bool kar_init() {
++    g_kar.tried = true;
++    const char * dir = getenv("YUE_ENGINE_AR");
++    if (!dir || !*dir) return false;
++    char p[1024], fb[8] = { 0 };
++    snprintf(p, sizeof(p), "%s/format.txt", dir);
++    FILE * f = fopen(p, "rb");
++    if (f) { size_t n = fread(fb, 1, 7, f); (void) n; fclose(f); }
++    g_kar.fmt = !strncmp(fb, "q8", 2) ? 1 : !strncmp(fb, "q4", 2) ? 2 : 0;
++    const size_t nW = (size_t) KN_D * KN_D * 2 + (size_t) KN_D * KN_KV * 2 + (size_t) KN_D * KN_F * 3;
++    g_kar.wB = g_kar.fmt == 1 ? nW + nW / 16 : g_kar.fmt == 2 ? nW / 2 + nW / 16 : nW * 2;
++    for (int i = 0; i < KN_MAX; i++) { snprintf(p, sizeof(p), "%s/weights_l%d.bin", dir, i); FILE * t = fopen(p, "rb"); if (!t) break; fclose(t); g_kar.nl = i + 1; }
++    if (!g_kar.nl) { fprintf(stderr, "[Kroma-AR] no weights_l0.bin in %s\n", dir); return false; }
++    double t0 = kn_now();
++    g_kar.wall = (uint16_t *) kn_alloc(g_kar.wB * g_kar.nl); g_kar.prall = (float *) kn_alloc((size_t) (2 * KN_D + 256) * 4 * g_kar.nl);
++    for (int i = 0; i < g_kar.nl; i++) {
++        char n[64];
++        g_kar.w[i] = g_kar.wall ? g_kar.wall + i * (g_kar.wB / 2) : nullptr; g_kar.prm[i] = g_kar.prall ? g_kar.prall + (size_t) i * (2 * KN_D + 256) : nullptr;
++        if (!g_kar.w[i] || !g_kar.prm[i]) { fprintf(stderr, "[Kroma-AR] rpcmem for layer %d failed\n", i); kar_release(); return false; }
++        snprintf(n, sizeof(n), "weights_l%d.bin", i); if (!kn_read(dir, n, g_kar.w[i], g_kar.wB)) { kar_release(); return false; }
++        snprintf(n, sizeof(n), "prm_l%d.f32", i); if (!kn_read(dir, n, g_kar.prm[i], (2 * KN_D + 256) * 4)) { kar_release(); return false; }
++    }
++    struct remote_rpc_control_unsigned_module um = { CDSP_DOMAIN_ID, 1 };
++    int err = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &um, sizeof(um));
++    const char * skel = getenv("KROMA_SKEL");
++    char uri[256];
++    if (skel && *skel) snprintf(uri, sizeof(uri), "file:///%s?kblock_skel_handle_invoke&_modver=1.0&_idlver=1.0.0%s", skel, CDSP_DOMAIN);
++    else snprintf(uri, sizeof(uri), "%s%s", kblock_URI, CDSP_DOMAIN);
++    if (err || (err = kblock_open(uri, &g_kar.h))) { fprintf(stderr, "[Kroma-AR] DSP open failed 0x%x\n", err); g_kar.h = 0; kar_release(); return false; }
++    fprintf(stderr, "[Kroma-AR] prefill on the DSP: %d layers, %s weights %.0f MB, loaded in %.1f s\n", g_kar.nl,
++            g_kar.fmt == 1 ? "q8" : g_kar.fmt == 2 ? "q4" : "fp16", g_kar.wB * g_kar.nl / 1048576.0, kn_now() - t0);
++    return g_kar.ok = true;
++}
++
++// rows [0, n) of a ggml weight [H, V] (any type) as floats
++static void kar_rows_f32(const ggml_tensor * t, const int * ids, int n, int H, float * dst) {
++    const size_t rb = ggml_row_size(t->type, H);
++    std::vector<uint8_t> raw(rb);
++    const auto * tr = ggml_get_type_traits(t->type);
++    for (int i = 0; i < n; i++) {
++        ggml_backend_tensor_get(t, raw.data(), (size_t) ids[i] * rb, rb);
++        if (t->type == GGML_TYPE_F32) memcpy(dst + (size_t) i * H, raw.data(), (size_t) H * 4);
++        else tr->to_float(raw.data(), dst + (size_t) i * H, H);
++    }
++}
++
++// logits[r] = head row (row0 + r) . h, the rows dequantized a block of them at a time over 4 threads
++static void kar_head(const ggml_tensor * head, const float * h, int H, int row0, int rows, float * logits) {
++    const size_t rb = ggml_row_size(head->type, H);
++    const auto * tr = ggml_get_type_traits(head->type);
++    auto work = [&](int a, int b) {
++        std::vector<uint8_t> raw(rb * 64); std::vector<float> w((size_t) H);
++        for (int r = a; r < b; r += 64) {
++            const int n = std::min(64, b - r);
++            ggml_backend_tensor_get(head, raw.data(), (size_t) (row0 + r) * rb, rb * n);
++            for (int j = 0; j < n; j++) {
++                if (head->type == GGML_TYPE_F32) memcpy(w.data(), raw.data() + rb * j, (size_t) H * 4);
++                else tr->to_float(raw.data() + rb * j, w.data(), H);
++                double s = 0; for (int k = 0; k < H; k++) s += (double) w[k] * h[k];
++                logits[r + j] = (float) s;
++            }
++        }
++    };
++    std::vector<std::thread> th; const int nt = 4, per = (rows + nt - 1) / nt;
++    for (int t = 0; t < nt; t++) { int a = t * per, b = std::min(rows, a + per); if (a < b) th.emplace_back(work, a, b); }
++    for (auto & t : th) t.join();
++}
++
++// one prefill as qw3lm_forward: token_ids [n] into set kv_set (empty), the logits of the last row's LM head window
++static bool kar_forward(Qwen3LM * m, Qw3lmKvCache * kv, const int * token_ids, int n, int kv_set, float * logits, int row0, int rows) {
++    if (g_qw3lm_has_adapters || kv->pos[kv_set] != 0 || n < 2) return false;
++    if (!g_kar.tried) kar_init();
++    if (!g_kar.ok) return false;
++    // the rows (keys) a multiple of 384, as kn_prepare pads them: the attention's value chunk then divides them (816 keys in chunks
++    // of 13 blocks came out 120% off; the padded rows come after every real one, so the causal mask keeps them out)
++    int Np = (n + 31) / 32 * 32; while (Np % 384) Np += 32;
++    const int H = KN_D, S = (int) kv->k[kv_set][0]->ne[1];
++    if (Np > KAR_MAXN || n > S || m->cfg.hidden_size != KN_D || m->cfg.n_layers != g_kar.nl) return false;
++    double t0 = kn_now();
++    const size_t nI = (size_t) Np * KN_D + (size_t) Np * 128;
++    const size_t nS = (size_t) Np * KN_D * 3 + (size_t) Np * KN_KV * 2 + (size_t) Np * KN_KV * 2 + (size_t) Np * KN_F;
++    if (g_kar.inp_n < nI) { if (g_kar.inp) rpcmem_free(g_kar.inp); g_kar.inp = (uint16_t *) kn_alloc(nI * 2); g_kar.inp_n = nI; }
++    if (g_kar.scr_n < nS) { if (g_kar.scr) rpcmem_free(g_kar.scr); g_kar.scr = (uint16_t *) kn_alloc(nS * 2); g_kar.scr_n = nS; }
++    if (g_kar.xo_n < (size_t) Np * KN_D) { if (g_kar.xo) rpcmem_free(g_kar.xo); g_kar.xo = (uint16_t *) kn_alloc((size_t) Np * KN_D * 2); g_kar.xo_n = (size_t) Np * KN_D; }
++    if (!g_kar.inp || !g_kar.scr || !g_kar.xo) { kar_release(); return false; }
++    // the embedding rows and the RoPE of positions 0..Np-1 (NEOX: dimension d with d + 64)
++    {
++        std::vector<float> e((size_t) n * H);
++        kar_rows_f32(m->embed_tokens, token_ids, n, H, e.data());
++        kn_to_act(e.data(), Np, H, n, g_kar.inp);
++        std::vector<float> rope((size_t) Np * 128);
++        const double theta = m->cfg.rope_theta > 0 ? m->cfg.rope_theta : 1e6;
++        for (int i = 0; i < Np; i++)
++            for (int j = 0; j < 64; j++) {
++                double a = (double) i * pow(theta, -2.0 * j / KN_DH);
++                rope[(size_t) i * 128 + j] = (float) cos(a); rope[(size_t) i * 128 + 64 + j] = (float) sin(a);
++            }
++        kn_to_act(rope.data(), Np, 128, Np, g_kar.inp + (size_t) Np * KN_D);
++    }
++    double t_cpu = kn_now() - t0, t_dsp = 0, t_kv = 0;
++    std::vector<float> head((size_t) Np * KN_DH);
++    std::vector<__fp16> rowsK((size_t) n * KN_DH);
++    for (int l = 0; l < g_kar.nl; l++) {
++        double c0 = kn_now(); uint32_t tm[12];
++        // causal (bit 24): query row r sees keys 0..r; no masked ranges (the padded rows come after every real one)
++        int err = kblock_yrun(g_kar.h, g_kar.w[l], (int) (g_kar.wB / 2), g_kar.inp, (int) nI, g_kar.prm[l], 2 * KN_D + 256,
++                              g_kar.scr, (int) nS, g_kar.xo, Np * KN_D, Np, 0, 0, 0, 0, 0, (l ? 1 : 0) | g_kar.fmt << 8 | 1 << 24, tm, 12);
++        t_dsp += kn_now() - c0; c0 = kn_now();
++        if (err) { fprintf(stderr, "[Kroma-AR] yrun layer %d failed 0x%x, back to ggml\n", l, err); kar_release(); return false; }
++        // this layer's new K (normed, rotated) and V out of the scratch, into the cache rows 0..n-1 of each kv head
++        const uint16_t * kn = g_kar.scr + (size_t) Np * KN_D * 3, *vn = kn + (size_t) Np * KN_KV;
++        for (int hd = 0; hd < KN_KH; hd++) {
++            kn_from_act(kn + (size_t) hd * Np * KN_DH, KN_DH, 0, n, head.data());
++            for (size_t q = 0; q < rowsK.size(); q++) rowsK[q] = (__fp16) head[q];
++            ggml_backend_tensor_set(kv->k[kv_set][l], rowsK.data(), (size_t) hd * S * KN_DH * 2, rowsK.size() * 2);
++            // V: per 64-column half a, per block column b, the row tiles (as kn_prepare writes them)
++            const __fp16 * vs = (const __fp16 *) (vn + (size_t) hd * Np * KN_DH);
++            for (int a = 0; a < 2; a++)
++                for (int b = 0; b < 2; b++) {
++                    const __fp16 * d = vs + (size_t) a * Np * 64 + (size_t) b * (Np / 32) * 1024;
++                    const int c0v = (2 * a + b) * 32;
++                    for (int r = 0; r < n; r++)
++                        for (int c = 0; c < 32; c++) rowsK[(size_t) r * KN_DH + c0v + c] = d[(size_t) (r / 32) * 1024 + kn_bi(r % 32, c)];
++                }
++            ggml_backend_tensor_set(kv->v[kv_set][l], rowsK.data(), (size_t) hd * S * KN_DH * 2, rowsK.size() * 2);
++        }
++        t_kv += kn_now() - c0;
++    }
++    // the last row: final norm, the LM head window
++    double c0 = kn_now();
++    std::vector<float> h((size_t) H), fn((size_t) H);
++    kn_from_act(g_kar.xo, H, n - 1, 1, h.data());
++    if (m->final_norm->type == GGML_TYPE_F32) ggml_backend_tensor_get(m->final_norm, fn.data(), 0, (size_t) H * 4);
++    else { int z = 0; kar_rows_f32(m->final_norm, &z, 1, H, fn.data()); }
++    double ss = 0; for (int k = 0; k < H; k++) ss += (double) h[k] * h[k];
++    const float sc = 1.f / sqrtf((float) (ss / H) + m->cfg.rms_norm_eps);
++    for (int k = 0; k < H; k++) h[k] *= sc * fn[k];
++    kar_head(m->lm_head, h.data(), H, row0, rows, logits);
++    kv->pos[kv_set] += n;
++    fprintf(stderr, "[Kroma-AR] %d rows (padded %d): DSP %.2f s, cache %.2f s, CPU %.2f s + head %.2f s\n", n, Np, t_dsp, t_kv, t_cpu,
++            kn_now() - c0);
++    return true;
++}
+diff --git a/src/kroma_nar.h b/src/kroma_nar.h
+new file mode 100644
+index 0000000..cb1680f
+--- /dev/null
++++ b/src/kroma_nar.h
+@@ -0,0 +1,242 @@
++// kroma_nar.h : the NAR velocity on the Kroma engine (the phone's DSP, kblock_yrun) instead of ggml on the CPU.
++//
++// On when YUE_ENGINE names a folder with the engine's files (made by Kroma's converter tools, not in this repository):
++//   weights_l<i>.bin, prm_l<i>.f32, io.f32, format.txt -- and libkblock_skel.so reachable through ADSP_LIBRARY_PATH.
++// Per velocity evaluation: the input projections on the CPU, the 28 layers on the DSP (the layers' weights kept in shared
++// memory from the first call), the final norm and the velocity head on the CPU. The AR prefix's K and V are read once per
++// KV set from the ggml cache into the engine's layouts. Anything that fails turns the engine off and ggml carries on.
++#pragma once
++
++#include "kblock.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++#include <vector>
++
++#define KN_D   2048
++#define KN_KV  1024
++#define KN_F   6144
++#define KN_DH  128
++#define KN_KH  8
++#define KN_MAX 64
++
++struct KromaNarSet {             // one KV set's prefix, in the engine's per-layer input buffers
++    int        set = -1, ar_len = 0, N = 0, P = 0;
++    uint16_t * inp[KN_MAX] = {};  // per layer: x [N x D] | rope [N x 128] | prefix K | prefix V
++};
++struct KromaNar {
++    bool               tried = false, ok = false;
++    remote_handle64    h     = 0;
++    int                nl = 0, fmt = 0;
++    size_t             wB = 0;
++    uint16_t *         w[KN_MAX]   = {};
++    float *            prm[KN_MAX] = {};
++    std::vector<float> io;        // vae2llm W, b | time W0, b0, W1, b1 | final norm | llm2vae W, b
++    KromaNarSet        sets[2];
++    int                next_slot = 0;
++    uint16_t *         scr = nullptr, *xo = nullptr;
++    size_t             scr_n = 0, xo_n = 0;
++    double             t_dsp = 0, t_cpu = 0;
++    int                evals = 0;
++};
++static KromaNar g_kn;
++
++static void * kn_alloc(size_t bytes) { return rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, bytes); }
++static double kn_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
++static bool kn_read(const char * dir, const char * name, void * dst, size_t bytes) {
++    char p[1024]; snprintf(p, sizeof(p), "%s/%s", dir, name);
++    FILE * f = fopen(p, "rb"); if (!f) { fprintf(stderr, "[Kroma] cannot open %s\n", p); return false; }
++    size_t n = fread(dst, 1, bytes, f); fclose(f);
++    if (n != bytes) { fprintf(stderr, "[Kroma] %s: %zu of %zu bytes\n", p, n, bytes); return false; }
++    return true;
++}
++// (r, c) of a 32 x 32 block at 32 (r & ~1) + 2c + (r & 1)
++static inline size_t kn_bi(int r, int c) { return (size_t) (32 * (r & ~1) + 2 * c + (r & 1)); }
++// row-major float [M x K] (rows past rows_valid zero) -> the activation layout: per 32-row tile its K/32 blocks
++static void kn_to_act(const float * src, int M, int K, int rows_valid, uint16_t * dst) {
++    __fp16 * d = (__fp16 *) dst;
++    for (int t = 0; t < M / 32; t++)
++        for (int cb = 0; cb < K / 32; cb++) {
++            __fp16 * b = d + ((size_t) t * (K / 32) + cb) * 1024;
++            for (int r = 0; r < 32; r++) {
++                int row = t * 32 + r;
++                for (int c = 0; c < 32; c++) b[kn_bi(r, c)] = (__fp16) (row < rows_valid ? src[(size_t) row * K + cb * 32 + c] : 0.f);
++            }
++        }
++}
++static void kn_from_act(const uint16_t * src, int K, int row0, int rows, float * dst) {
++    const __fp16 * s = (const __fp16 *) src;
++    for (int i = 0; i < rows; i++) {
++        int row = row0 + i, t = row / 32, r = row % 32;
++        for (int k = 0; k < K; k++) dst[(size_t) i * K + k] = (float) s[((size_t) t * (K / 32) + k / 32) * 1024 + kn_bi(r, k % 32)];
++    }
++}
++// y [rows x out] = x [rows x in] W^T + b, W [out x in] row-major, on 4 threads
++static void kn_linear(const float * x, int rows, int in, const float * W, const float * b, int out, float * y) {
++    auto part = [&](int r0, int r1) {
++        for (int r = r0; r < r1; r++)
++            for (int o = 0; o < out; o++) {
++                const float * wr = W + (size_t) o * in; const float * xr = x + (size_t) r * in; float s = b ? b[o] : 0.f;
++                for (int k = 0; k < in; k++) s += wr[k] * xr[k];
++                y[(size_t) r * out + o] = s;
++            }
++    };
++    std::thread th[4];
++    for (int t = 0; t < 4; t++) th[t] = std::thread(part, rows * t / 4, rows * (t + 1) / 4);
++    for (auto & t : th) t.join();
++}
++
++static bool kn_init() {
++    g_kn.tried = true;
++    const char * dir = getenv("YUE_ENGINE"); if (!dir || !*dir) return false;
++    char p[1024]; snprintf(p, sizeof(p), "%s/format.txt", dir); FILE * f = fopen(p, "r"); char fb[8] = { 0 };
++    if (f) { size_t n = fread(fb, 1, 7, f); (void) n; fclose(f); }
++    g_kn.fmt = !strncmp(fb, "q8", 2) ? 1 : !strncmp(fb, "q4", 2) ? 2 : 0;
++    const size_t nW = (size_t) KN_D * KN_D * 2 + (size_t) KN_D * KN_KV * 2 + (size_t) KN_D * KN_F * 3;
++    g_kn.wB = g_kn.fmt == 1 ? nW * 17 / 16 : g_kn.fmt == 2 ? nW * 9 / 16 : nW * 2;
++    for (int i = 0; i < KN_MAX; i++) { snprintf(p, sizeof(p), "%s/weights_l%d.bin", dir, i); FILE * t = fopen(p, "rb"); if (!t) break; fclose(t); g_kn.nl = i + 1; }
++    if (!g_kn.nl) { fprintf(stderr, "[Kroma] no weights_l0.bin in %s\n", dir); return false; }
++    double t0 = kn_now();
++    for (int i = 0; i < g_kn.nl; i++) {
++        char n[64];
++        g_kn.w[i] = (uint16_t *) kn_alloc(g_kn.wB); g_kn.prm[i] = (float *) kn_alloc((2 * KN_D + 256) * 4);
++        if (!g_kn.w[i] || !g_kn.prm[i]) { fprintf(stderr, "[Kroma] rpcmem for layer %d failed\n", i); return false; }
++        snprintf(n, sizeof(n), "weights_l%d.bin", i); if (!kn_read(dir, n, g_kn.w[i], g_kn.wB)) return false;
++        snprintf(n, sizeof(n), "prm_l%d.f32", i); if (!kn_read(dir, n, g_kn.prm[i], (2 * KN_D + 256) * 4)) return false;
++    }
++    const size_t nio = (size_t) KN_D * 64 + KN_D + (size_t) KN_D * 256 + KN_D + (size_t) KN_D * KN_D + KN_D + KN_D + (size_t) 64 * KN_D + 64;
++    g_kn.io.resize(nio); if (!kn_read(dir, "io.f32", g_kn.io.data(), nio * 4)) return false;
++    struct remote_rpc_control_unsigned_module um = { CDSP_DOMAIN_ID, 1 };
++    int err = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &um, sizeof(um));
++    // KROMA_SKEL: the app's skel for this chip (libkengine_skel_<arch>.so, the same kblock interface), else libkblock_skel.so
++    const char * skel = getenv("KROMA_SKEL");
++    char uri[256];
++    if (skel && *skel) snprintf(uri, sizeof(uri), "file:///%s?kblock_skel_handle_invoke&_modver=1.0&_idlver=1.0.0%s", skel, CDSP_DOMAIN);
++    else snprintf(uri, sizeof(uri), "%s%s", kblock_URI, CDSP_DOMAIN);
++    if (err || (err = kblock_open(uri, &g_kn.h))) { fprintf(stderr, "[Kroma] DSP open failed 0x%x\n", err); return false; }
++    fprintf(stderr, "[Kroma] NAR on the DSP: %d layers, %s weights %.0f MB, loaded in %.1f s\n", g_kn.nl,
++            g_kn.fmt == 1 ? "q8" : g_kn.fmt == 2 ? "q4" : "fp16", g_kn.wB * g_kn.nl / 1048576.0, kn_now() - t0);
++    return g_kn.ok = true;
++}
++
++// the prefix of one KV set in the engine's layouts, in every layer's input buffer (with the rope of the N rows)
++static KromaNarSet * kn_prepare(const Qw3lmKvCache * kv, int set, int ar_len, int Nr) {
++    for (auto & s : g_kn.sets) if (s.set == set && s.ar_len == ar_len && s.N == Nr) return &s;
++    KromaNarSet & s = g_kn.sets[g_kn.next_slot]; g_kn.next_slot ^= 1;
++    for (int l = 0; l < KN_MAX; l++) if (s.inp[l]) { rpcmem_free(s.inp[l]); s.inp[l] = nullptr; }
++    int P = (ar_len + 31) / 32 * 32; while ((P + Nr) % 384) P += 32;           // the keys a multiple of the attention's value chunk
++    s.set = set; s.ar_len = ar_len; s.N = Nr; s.P = P;
++    const size_t nI = (size_t) Nr * 128 + (size_t) P * KN_KV * 2;              // no x here (yrun's bit 28): it starts in xo, 28 copies of its room saved
++    const int S = (int) kv->k[set][0]->ne[1];                                     // the cache's rows per head
++    std::vector<__fp16> raw((size_t) ar_len * KN_DH);
++    std::vector<float>  rope((size_t) Nr * 128);
++    for (int i = 0; i < Nr; i++)                                                 // NEOX: dimension d with d + 64
++        for (int j = 0; j < 64; j++) {
++            double a = (double) (ar_len + i) * pow(1e6, -2.0 * j / KN_DH);
++            rope[(size_t) i * 128 + j] = (float) cos(a); rope[(size_t) i * 128 + 64 + j] = (float) sin(a);
++        }
++    std::vector<uint16_t> rope_act((size_t) Nr * 128); kn_to_act(rope.data(), Nr, 128, Nr, rope_act.data());
++    std::vector<float> head((size_t) P * KN_DH);
++    for (int l = 0; l < g_kn.nl; l++) {
++        uint16_t * in = (uint16_t *) kn_alloc(nI * 2); if (!in) return nullptr; s.inp[l] = in;
++        memcpy(in, rope_act.data(), rope_act.size() * 2);
++        uint16_t * pk = in + (size_t) Nr * 128, *pv = pk + (size_t) P * KN_KV;
++        for (int hd = 0; hd < KN_KH; hd++) {
++            for (int which = 0; which < 2; which++) {
++                const ggml_tensor * t = which ? kv->v[set][l] : kv->k[set][l];
++                ggml_backend_tensor_get(t, raw.data(), (size_t) hd * S * KN_DH * 2, raw.size() * 2);
++                std::fill(head.begin(), head.end(), 0.f);
++                for (size_t q = 0; q < raw.size(); q++) head[q] = (float) raw[q];
++                if (!which) kn_to_act(head.data(), P, KN_DH, ar_len, pk + (size_t) hd * P * KN_DH);   // K: the head layout
++                else                                                                                // V: per 64-column half, per block column, the row tiles
++                    for (int a = 0; a < 2; a++)
++                        for (int b = 0; b < 2; b++) {
++                            __fp16 * d = (__fp16 *) (pv + (size_t) hd * P * KN_DH + (size_t) a * P * 64 + (size_t) b * (P / 32) * 1024);
++                            const int c0 = (2 * a + b) * 32;
++                            for (int tt = 0; tt < P / 32; tt++)
++                                for (int r = 0; r < 32; r++)
++                                    for (int c = 0; c < 32; c++) d[(size_t) tt * 1024 + kn_bi(r, c)] = (__fp16) head[(size_t) (tt * 32 + r) * KN_DH + c0 + c];
++                        }
++            }
++        }
++    }
++    fprintf(stderr, "[Kroma] prefix of set %d: %d rows (padded %d), %d latent rows (padded %d)\n", set, ar_len, P, Nr, Nr);
++    return &s;
++}
++
++// The most frames of a chunk the DSP's attention can take after this prefix. It keeps in VTCM (8MB on every chip so far) the queries,
++// K^T, V, the output, three score rows, its spare, the ones and the sums: 2KB x (4 nq + 13 nk + 5 + the sums), nothing checks it, and
++// past the end the blocks overwrite each other: silence (NaN), or just past it noise (every song over about 9000 keys).
++static int kn_max_frames(int prefix) {
++    const size_t room = (size_t) 3200 << 20;
++    int best = 0;
++    for (int f = 32; f < 24576; f += 32) {
++        const int ar_len = prefix + f + 1, Nr = (f + 2 + 31) / 32 * 32;
++        int P = (ar_len + 31) / 32 * 32; while ((P + Nr) % 384) P += 32;
++        // the attention takes any length in slabs (attention_big); the limit is what the DSP can map, its address space being 32-bit: the
++        // layers' weights (q8), every layer's prefix and rope, the scratch, under 3.2GB
++        const size_t nI = (size_t) Nr * 128 + (size_t) P * KN_KV * 2, nS = (size_t) Nr * KN_D * 3 + (size_t) Nr * KN_KV * 2 + (size_t) (P + Nr) * KN_KV * 2 + (size_t) Nr * KN_F;
++        if (((size_t) 1450 << 20) + 28 * nI * 2 + (nS + (size_t) Nr * KN_D) * 2 > room) break;
++        best = f;
++    }
++    return best;
++}
++
++// one velocity evaluation, as nar_velocity: x_t [M, T_lat, latent_dim] -> v_out
++static bool kn_velocity(const Yue2NAR * n, const Qw3lmKvCache * kv, const float * x_t, int T_lat, int M, int ar_len, int kv_set,
++                        float raw_t, float * v_out) {
++    if (!g_kn.tried) kn_init();
++    if (!g_kn.ok) return false;
++    const int N = T_lat + 2, Nr = (N + 31) / 32 * 32, LD = n->latent_dim;
++    KromaNarSet * s = kn_prepare(kv, kv_set, ar_len, Nr); if (!s) { g_kn.ok = false; return false; }
++    const int P = s->P;
++    const size_t nS = (size_t) Nr * KN_D * 3 + (size_t) Nr * KN_KV * 2 + (size_t) (P + Nr) * KN_KV * 2 + (size_t) Nr * KN_F;
++    if (g_kn.scr_n < nS) { if (g_kn.scr) rpcmem_free(g_kn.scr); g_kn.scr = (uint16_t *) kn_alloc(nS * 2); g_kn.scr_n = nS; }
++    if (g_kn.xo_n < (size_t) Nr * KN_D) { if (g_kn.xo) rpcmem_free(g_kn.xo); g_kn.xo = (uint16_t *) kn_alloc((size_t) Nr * KN_D * 2); g_kn.xo_n = (size_t) Nr * KN_D; }
++    if (!g_kn.scr || !g_kn.xo) { g_kn.ok = false; return false; }
++    const float *v2l_w = g_kn.io.data(), *v2l_b = v2l_w + KN_D * 64, *t_w0 = v2l_b + KN_D, *t_b0 = t_w0 + KN_D * 256, *t_w1 = t_b0 + KN_D,
++                *t_b1 = t_w1 + (size_t) KN_D * KN_D, *fnorm = t_b1 + KN_D, *l2v_w = fnorm + KN_D, *l2v_b = l2v_w + 64 * KN_D;
++    double c0 = kn_now();
++    // the shared timestep embedding and the frame embedding
++    float feats[YUE2_TIME_EMBED_DIM]; nar_time_features(nar_shift_t(n, raw_t), feats);
++    std::vector<float> te(KN_D), te2(KN_D);
++    kn_linear(feats, 1, 256, t_w0, t_b0, KN_D, te.data()); for (auto & v : te) v = v / (1.f + expf(-v));
++    kn_linear(te.data(), 1, KN_D, t_w1, t_b1, KN_D, te2.data());
++    std::vector<float> pos((size_t) N * KN_D); nar_pos_features(N, KN_D, pos.data());
++    std::vector<float> xin((size_t) N * LD), hid((size_t) N * KN_D), out((size_t) T_lat * KN_D), vel((size_t) T_lat * LD);
++    std::vector<uint16_t> act((size_t) Nr * KN_D);
++    g_kn.t_cpu += kn_now() - c0;
++    for (int m = 0; m < M; m++) {
++        c0 = kn_now();
++        std::fill(xin.begin(), xin.end(), 0.f);                                   // LATENT_START, the frames, LATENT_END
++        memcpy(xin.data() + LD, x_t + (size_t) m * T_lat * LD, (size_t) T_lat * LD * 4);
++        kn_linear(xin.data(), N, LD, v2l_w, v2l_b, KN_D, hid.data());
++        for (int i = 0; i < N; i++) for (int k = 0; k < KN_D; k++) hid[(size_t) i * KN_D + k] += te2[k] + pos[(size_t) i * KN_D + k];
++        kn_to_act(hid.data(), Nr, KN_D, N, act.data());
++        memcpy(g_kn.xo, act.data(), act.size() * 2);
++        g_kn.t_cpu += kn_now() - c0; c0 = kn_now();
++        uint32_t tm[12];
++        for (int l = 0; l < g_kn.nl; l++) {
++            int err = kblock_yrun(g_kn.h, g_kn.w[l], (int) (g_kn.wB / 2), s->inp[l], (int) ((size_t) Nr * 128 + (size_t) P * KN_KV * 2),
++                                  g_kn.prm[l], 2 * KN_D + 256, g_kn.scr, (int) nS, g_kn.xo, Nr * KN_D, Nr, P, ar_len, P, P + N, P + Nr,
++                                  1 | (1 << 28) | g_kn.fmt << 8, tm, 12);
++            if (err) { fprintf(stderr, "[Kroma] yrun layer %d failed 0x%x, back to ggml\n", l, err); g_kn.ok = false; return false; }
++        }
++        g_kn.t_dsp += kn_now() - c0; c0 = kn_now();
++        kn_from_act(g_kn.xo, KN_D, 1, T_lat, out.data());                       // the frames' rows
++        for (int i = 0; i < T_lat; i++) {
++            float * r = out.data() + (size_t) i * KN_D; double ss = 0; for (int k = 0; k < KN_D; k++) ss += (double) r[k] * r[k];
++            float sc = 1.f / sqrtf((float) (ss / KN_D) + 1e-6f); for (int k = 0; k < KN_D; k++) r[k] *= sc * fnorm[k];
++        }
++        kn_linear(out.data(), T_lat, KN_D, l2v_w, l2v_b, LD, vel.data());
++        memcpy(v_out + (size_t) m * T_lat * LD, vel.data(), vel.size() * 4);
++        g_kn.t_cpu += kn_now() - c0;
++    }
++    if (++g_kn.evals % 8 == 0)
++        fprintf(stderr, "[Kroma] %d evaluations: DSP %.2f s, CPU %.2f s an evaluation\n", g_kn.evals, g_kn.t_dsp / g_kn.evals, g_kn.t_cpu / g_kn.evals);
++    return true;
++}
+diff --git a/src/kroma_vae.h b/src/kroma_vae.h
+new file mode 100644
+index 0000000..abc4efd
+--- /dev/null
++++ b/src/kroma_vae.h
+@@ -0,0 +1,62 @@
++// kroma_vae.h : the VAE decoder on the Kroma engine (the phone's DSP, kblock_adec) instead of ggml on the CPU.
++//
++// On when YUE_ENGINE_VAE names a folder with adec.w and adec.prm (made by Kroma's converter tools), and the skel as for kroma_nar.h.
++// Tiles as vae_ggml_decode_tiled's: a core and a halo, the cores concatenated. A failure leaves the decode to ggml.
++#pragma once
++
++#include "kroma_nar.h"
++
++#ifndef KROMA_VAE_HOOK_DECL
++#define KROMA_VAE_HOOK_DECL
++static int (*g_vae_dsp_hook)(const float *, int, float *, int, bool (*)(void *), void *) = nullptr;
++#endif
++
++static int kvd_decode(const float * latent, int T_latent, float * audio_out, int max_T_audio, bool (*cancel)(void *), void * cancel_data) {
++    const char * dir = getenv("YUE_ENGINE_VAE");
++    if (!dir || !*dir) return -1;
++    const int total = T_latent * 1920 - 64, core = 512, halo = 16;
++    if (total > max_T_audio) return -1;
++    char p[1024]; long sw = 0, sp = 0; FILE * f;
++    snprintf(p, sizeof(p), "%s/adec.w", dir); if ((f = fopen(p, "rb"))) { fseek(f, 0, SEEK_END); sw = ftell(f); fclose(f); }
++    snprintf(p, sizeof(p), "%s/adec.prm", dir); if ((f = fopen(p, "rb"))) { fseek(f, 0, SEEK_END); sp = ftell(f); fclose(f); }
++    if (!sw || !sp) return -1;
++    struct remote_rpc_control_unsigned_module um = { CDSP_DOMAIN_ID, 1 };
++    int err = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, (void *) &um, sizeof(um));
++    const char * skel = getenv("KROMA_SKEL"); char uri[256];
++    if (skel && *skel) snprintf(uri, sizeof(uri), "file:///%s?kblock_skel_handle_invoke&_modver=1.0&_idlver=1.0.0%s", skel, CDSP_DOMAIN);
++    else snprintf(uri, sizeof(uri), "%s%s", kblock_URI, CDSP_DOMAIN);
++    remote_handle64 h = 0;
++    if (err || (err = kblock_open(uri, &h))) { fprintf(stderr, "[Kroma-VAE] DSP open failed 0x%x\n", err); return -1; }
++    const int Tmax = T_latent < core + 2 * halo ? T_latent : core + 2 * halo, Mm = (Tmax + 31) & ~31;
++    const size_t slot = ((size_t) Tmax * 1920 + 8192) * 64 + (size_t) Mm * 2048 * 8, nS = 3 * slot, nY = slot, nX = (size_t) Mm * 64;
++    uint16_t * w = (uint16_t *) kn_alloc(sw), * x = (uint16_t *) kn_alloc(nX * 2), * s = (uint16_t *) kn_alloc(nS * 2), * y = (uint16_t *) kn_alloc(nY * 2); float * prm = (float *) kn_alloc(sp);
++    int ret = -1; double t0 = kn_now(), t_dsp = 0;
++    if (w && x && s && y && prm && kn_read(dir, "adec.w", w, sw) && kn_read(dir, "adec.prm", prm, sp)) {
++        const int tiles = (T_latent + core - 1) / core; std::vector<float> z(nX); bool ok = true;
++        for (int i = 0; i < tiles && ok; i++) {
++            if (cancel && cancel(cancel_data)) { ok = false; break; }
++            const int start = i * core, end = start + core > T_latent ? T_latent : start + core;
++            const int left = start - halo < 0 ? 0 : start - halo, right = end + halo > T_latent ? T_latent : end + halo, T = right - left, M = (T + 31) & ~31;
++            std::fill(z.begin(), z.end(), 0.f); memcpy(z.data(), latent + (size_t) left * 64, (size_t) T * 64 * 4);
++            kn_to_act(z.data(), M, 64, T, x);
++            uint32_t tm[8]; double c0 = kn_now();
++            err = kblock_adec(h, w, (int) (sw / 2), prm, (int) (sp / 4), x, (int) nX, s, (int) nS, y, (int) nY, T, -1, tm, 8);
++            t_dsp += kn_now() - c0;
++            if (err) { fprintf(stderr, "[Kroma-VAE] tile %d failed 0x%x, back to ggml\n", i, err); ok = false; break; }
++            const int out_start = start * 1920, out_end = end * 1920 > total ? total : end * 1920, crop = (start - left) * 1920, len = out_end - out_start;
++            const __fp16 * o = (const __fp16 *) y;
++            for (int r = 0; r < len; r++) {
++                const int q = r + crop; const size_t b = (size_t) (q >> 5) * 2 * 1024 + kn_bi(q & 31, 0);
++                audio_out[out_start + r] = (float) o[b]; audio_out[max_T_audio + out_start + r] = (float) o[b + 2];
++            }
++        }
++        if (ok) {
++            memmove(audio_out + total, audio_out + max_T_audio, (size_t) total * sizeof(float)); ret = total;
++            fprintf(stderr, "[Kroma-VAE] %d tiles -> %d samples: DSP %.2f s, all %.2f s\n", tiles, total, t_dsp, kn_now() - t0);
++        }
++    }
++    for (void * q : { (void *) w, (void *) x, (void *) s, (void *) y, (void *) prm }) if (q) rpcmem_free(q);
++    kblock_close(h);
++    return ret;
++}
++static const bool g_kvd_hooked = (g_vae_dsp_hook = kvd_decode, true);

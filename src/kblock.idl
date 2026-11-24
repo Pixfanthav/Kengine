@@ -1,0 +1,33 @@
+// kblock.idl -- the CPU-to-DSP calls of the engine (blocks, VAE, text encoder products, SDXL runs): lengths and integers first, then the buffers.
+const string IDL_VERSION = "1.0.0";
+interface kblock : remote_handle64 {
+   long run(in sequence<uint16> wts, in sequence<uint16> inp, in sequence<float> prm, rout sequence<uint16> scr,
+            rout sequence<uint16> xo, in long tokens, in long ctxlen, in long ffn, in long kvalid, in long inplace, rout sequence<uint32> times);
+   long embed(in sequence<uint16> pat, in sequence<uint16> w, rout sequence<uint16> xo, in long tokens);
+   long final(in sequence<uint16> x, in sequence<uint16> w, in sequence<float> fmod, rout sequence<uint16> res, in long tokens);
+   long k2run(in sequence<uint16> wts, in sequence<uint16> inp, in sequence<float> prm, rout sequence<uint16> scr,
+              rout sequence<uint16> xo, in long tokens, in long ka, in long kb, in long ka2, in long kb2, in long inplace, rout sequence<uint32> times);
+   long probe(in long mode, rout sequence<uint16> res);
+   long yrun(in sequence<uint16> wts, in sequence<uint16> inp, in sequence<float> prm, rout sequence<uint16> scr,
+             rout sequence<uint16> xo, in long tokens, in long prefix, in long ka, in long kb, in long ka2, in long kb2, in long inplace,
+             rout sequence<uint32> times);
+   long vdec(in sequence<uint16> w, in sequence<float> prm, in sequence<uint16> x, rout sequence<uint16> scr, rout sequence<uint16> y,
+             in long h, in long wd, in long vw, in long start, in long stop, rout sequence<uint32> times);
+   long adec(in sequence<uint16> w, in sequence<float> prm, in sequence<uint16> x, rout sequence<uint16> scr, rout sequence<uint16> y,
+             in long t0, in long stop, rout sequence<uint32> times);
+   long yrunl(in sequence<uint16> wts, in sequence<uint16> rope, in sequence<uint16> pre, in sequence<float> prm, rout sequence<uint16> scr, rout sequence<uint16> xo,
+              rout sequence<uint16> kvo, rout sequence<uint16> pre2, in long tokens, in long prefix, in long nl, in long inplace, rout sequence<uint32> times);
+   long esr(in sequence<uint16> w, in sequence<float> prm, in sequence<uint16> x, rout sequence<uint16> scr, rout sequence<uint16> y,
+            in long h, in long wd, in long vw, in long n, rout sequence<uint32> times);
+   long qenc(in sequence<uint16> w, in sequence<float> prm, in sequence<uint16> x, rout sequence<uint16> scr, rout sequence<uint16> y,
+             in long h, in long wd, in long vw, rout sequence<uint32> times);
+   long xop(in sequence<uint16> w, in sequence<float> prm, in sequence<uint16> x, in sequence<uint16> x2, rout sequence<uint16> y,
+            in long op, in long h, in long wd, in long ci, in long co, rout sequence<uint32> times);
+   long xrun(in sequence<uint16> w, in sequence<float> prm, in sequence<uint32> tab, in sequence<uint16> ctx, in sequence<uint16> zin,
+             rout sequence<uint16> xa, rout sequence<uint16> xb, rout sequence<uint16> st0, rout sequence<uint16> sk, rout sequence<uint16> out,
+             rout sequence<uint32> times, in long fmt);
+   long xvae(in sequence<uint16> w, in sequence<float> prm, in sequence<uint16> x, rout sequence<uint16> scr, rout sequence<uint16> y,
+             in long h, in long wd, in long stop, rout sequence<uint32> times);
+   long lin(in sequence<uint16> w, in sequence<uint16> x, rout sequence<uint16> scr, rout sequence<uint16> y,
+            in long m, in long k, in long n, in long flags);
+};
